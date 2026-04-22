@@ -27,3 +27,6 @@ dump.rdb
 Thumbs.db
 .vscode/
 .idea/
+
+# output data
+dataset_exports/

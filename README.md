@@ -190,3 +190,55 @@ docker compose up -d
 ```
 
 其余 Python 模块仍可按本地方式启动，或继续使用 `./run_local.sh`（优先）。
+
+## 11. 结果打包为可加载数据集
+
+为了便于下游模型/数据集输入，项目新增了“当前结果导出为 JSONL 数据集”的能力，支持两种方式：
+
+1. Dashboard 导出：侧边栏 `📦 数据集导出` -> 点击 `导出当前结果为 JSONL`
+2. 命令行导出：
+
+```bash
+python3 export_dataset.py --output-dir ./dataset_exports --prefix search_snapshot
+```
+
+导出后会得到两个文件：
+
+- `*.jsonl`：统一记录格式（可直接喂给数据集加载器）
+- `*.meta.json`：快照元信息（时间、条数、统计）
+
+### 11.1 JSONL 字段说明
+
+每行一个 JSON 记录，核心字段如下：
+
+- `record_type`: `hot_topic` 或 `sample`
+- `keyword`: 关键词
+- `approx_count`: 仅 `hot_topic` 有值（Misra-Gries 近似计数）
+- `rank`: 仅 `hot_topic` 有值（热词排名）
+- `sample_index`: 仅 `sample` 有值（在水库中的位置）
+- `snapshot_total_processed`: 快照时累计处理条数
+- `snapshot_last_batch_count`: 快照时最近批次条数
+- `snapshot_last_update_epoch`: 快照时最近更新时间
+- `snapshot_exported_at`: 导出时间戳
+
+### 11.2 数据集加载示例
+
+项目提供了可直接运行的示例脚本：
+
+```bash
+python3 dataset_loader_example.py
+```
+
+也可以在你自己的代码里这样加载：
+
+```python
+import pandas as pd
+
+df = pd.read_json("./dataset_exports/search_snapshot_20260422_120000.jsonl", lines=True)
+
+hot_topics = df[df["record_type"] == "hot_topic"]
+samples = df[df["record_type"] == "sample"]
+
+# 下游训练输入示例（仅使用样本关键词）
+train_inputs = [{"text": kw} for kw in samples["keyword"].tolist()]
+```
