@@ -242,3 +242,67 @@ samples = df[df["record_type"] == "sample"]
 # 下游训练输入示例（仅使用样本关键词）
 train_inputs = [{"text": kw} for kw in samples["keyword"].tolist()]
 ```
+
+## 12. 如何证明“随机采样”和“热点估计”是可信的
+
+你提到的对比问题非常关键。项目现已支持“估计结果 vs 实时精确基线”对比（由处理器实时写入 Redis，Dashboard 直接展示）。
+
+### 12.1 开启精确基线
+
+默认开启（`ENABLE_EXACT_BASELINE=1`）。如果你关闭了，可显式设置：
+
+```bash
+export ENABLE_EXACT_BASELINE=1
+./stop_local.sh
+./run_local.sh
+```
+
+### 12.2 热点估计准确性（Misra-Gries）
+
+Dashboard 会展示：
+
+- `Top-K 召回率`：精确 Top-K 中有多少被 MG 捕获
+- `Top1 命中`：MG 第 1 名是否与精确第 1 名一致
+- `Top-K 重叠词数`：两者交集大小
+
+同时展示两张表：
+
+- MG 估计 Top-K
+- 精确基线 Top-K
+
+你可以在演示时直接对比这两张表来证明热点估计有效。
+
+### 12.3 随机采样可信度（Reservoir Sampling）
+
+Dashboard 会展示：
+
+- `采样分布偏差 TVD`
+- `采样分布相似度 = 1 - TVD`
+
+其中 TVD（Total Variation Distance）定义为：
+
+$$
+\mathrm{TVD}(P, Q) = \frac{1}{2}\sum_i |P(i)-Q(i)|
+$$
+
+- $P(i)$：精确基线中关键词 $i$ 的真实频率分布
+- $Q(i)$：水库样本中关键词 $i$ 的经验频率分布
+
+TVD 越小越好，相似度越高越好。
+
+### 12.4 内存节省怎么算（真实口径）
+
+现在内存节省不再用拍脑袋估算，而是基于 Python 对象真实大小（递归 `sys.getsizeof`）计算：
+
+- `exact_memory_bytes`：精确词频字典占用
+- `mg_memory_bytes`：Misra-Gries 状态字典占用
+
+节省比例定义：
+
+$$
+\mathrm{Saved\%} = \frac{\mathrm{ExactBytes}-\mathrm{MGBytes}}{\mathrm{ExactBytes}} \times 100\%
+$$
+
+如果 `ExactBytes` 为 0（冷启动阶段），节省比例按 0 处理。
+
+注意：精确基线用于评估与演示，会额外占用内存；生产环境可关闭它，仅保留亚线性状态。

@@ -29,6 +29,51 @@ def parse_hot_topics(client: redis.Redis):
     result.sort(key=lambda item: item[1], reverse=True)
     return result
 
+
+def parse_exact_top_topics(client: redis.Redis):
+    raw = client.hgetall("exact_top_topics")
+    result = []
+    for word, count in raw.items():
+        try:
+            result.append((word, int(count)))
+        except ValueError:
+            continue
+    result.sort(key=lambda item: item[1], reverse=True)
+    return result
+
+
+def parse_eval_metrics(client: redis.Redis):
+    raw = client.hgetall("eval_metrics")
+    if not raw:
+        return {}
+
+    def _to_float(key, default=0.0):
+        try:
+            return float(raw.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _to_int(key, default=0):
+        try:
+            return int(raw.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "topk_recall_at_k": _to_float("topk_recall_at_k"),
+        "top1_match": _to_int("top1_match"),
+        "overlap_count": _to_int("overlap_count"),
+        "reservoir_tvd": _to_float("reservoir_tvd", 1.0),
+        "reservoir_similarity": _to_float("reservoir_similarity"),
+        "mg_unique": _to_int("mg_unique"),
+        "exact_unique": _to_int("exact_unique"),
+        "mg_memory_bytes": _to_int("mg_memory_bytes"),
+        "exact_memory_bytes": _to_int("exact_memory_bytes"),
+        "reservoir_memory_bytes": _to_int("reservoir_memory_bytes"),
+        "memory_saved_percent": _to_float("memory_saved_percent"),
+        "exact_baseline_enabled": _to_int("exact_baseline_enabled", 0),
+    }
+
 def apply_config(client: redis.Redis, k: int, n: int) -> None:
     client.hset("control_config", mapping={"k": k, "n": n})
 
@@ -139,23 +184,24 @@ def format_bytes(size: float) -> str:
             return f"{size:.2f} {unit}"
         size /= 1024.0
 
-def calculate_memory_metrics(total_processed: int, k_value: int):
-    # 假设平均每个字符串 15 Bytes，Python 字典每个 Entry 约 80 Bytes，总计单条数据算 100 Bytes
-    BYTES_PER_ENTRY = 100 
-    
-    # 【传统 Hash Map】: 假设长尾分布下，20% 的词是独一无二的
+def calculate_memory_metrics(total_processed: int, k_value: int, eval_metrics: dict):
+    exact_memory_bytes = eval_metrics.get("exact_memory_bytes", 0)
+    mg_memory_bytes = eval_metrics.get("mg_memory_bytes", 0)
+    saved_percent = eval_metrics.get("memory_saved_percent", 0.0)
+
+    if exact_memory_bytes > 0:
+        return format_bytes(exact_memory_bytes), format_bytes(mg_memory_bytes), max(min(saved_percent, 99.99), -999.0)
+
+    # 基线未开启时，回退到估算逻辑，避免页面空白。
+    bytes_per_entry = 100
     unique_words_estimate = total_processed * 0.2
-    exact_memory = unique_words_estimate * BYTES_PER_ENTRY
-    
-    # 【Misra-Gries】: 永远只存 K 个
-    mg_memory = k_value * BYTES_PER_ENTRY
-    
-    # 节约比例
+    exact_memory = unique_words_estimate * bytes_per_entry
+    mg_memory = k_value * bytes_per_entry
     if exact_memory > 0:
         saved_percent = ((exact_memory - mg_memory) / exact_memory) * 100
     else:
         saved_percent = 0.0
-        
+
     return format_bytes(exact_memory), format_bytes(mg_memory), min(saved_percent, 99.99)
 
 
@@ -282,13 +328,15 @@ def main() -> None:
 
     # 获取数据
     hot_topics = parse_hot_topics(client)
+    exact_hot_topics = parse_exact_top_topics(client)
+    eval_metrics = parse_eval_metrics(client)
     samples = client.lrange("samples", 0, -1)
     total_processed = int(client.get("total_processed") or 0)
     last_batch_count = int(client.get("last_batch_count") or 0)
     last_update_epoch = int(client.get("last_update_epoch") or 0)
     
     # ================= 顶部 Metric (装逼核心区域) =================
-    exact_mem, mg_mem, saved_pct = calculate_memory_metrics(total_processed, int(k_value))
+    exact_mem, mg_mem, saved_pct = calculate_memory_metrics(total_processed, int(k_value), eval_metrics)
     top1_ratio, sample_diversity, freshness_seconds = calculate_operational_metrics(hot_topics, samples, last_update_epoch)
     
     # 判断状态灯
@@ -331,6 +379,40 @@ def main() -> None:
             st.warning(f"⚠️ {msg}")
     else:
         st.success("✅ 当前运行稳定，可用于实时趋势观察与异常发现")
+
+    st.subheader("🧪 准确性对比（估计 vs 实时精确基线）")
+    if eval_metrics.get("exact_baseline_enabled", 0) == 1:
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            st.metric("Top-K 召回率", f"{eval_metrics.get('topk_recall_at_k', 0.0) * 100:.1f}%")
+        with a2:
+            st.metric("Top1 命中", "是" if eval_metrics.get("top1_match", 0) == 1 else "否")
+        with a3:
+            st.metric("采样分布相似度", f"{eval_metrics.get('reservoir_similarity', 0.0) * 100:.1f}%")
+        with a4:
+            st.metric("采样分布偏差 TVD", f"{eval_metrics.get('reservoir_tvd', 1.0):.3f}")
+
+        st.caption(
+            f"精确唯一词数: {eval_metrics.get('exact_unique', 0):,} | "
+            f"MG 唯一词数: {eval_metrics.get('mg_unique', 0):,} | "
+            f"Top-K 重叠词数: {eval_metrics.get('overlap_count', 0)}"
+        )
+
+        compare_left, compare_right = st.columns(2)
+        with compare_left:
+            st.markdown("**MG 估计 Top-K**")
+            if hot_topics:
+                st.dataframe(pd.DataFrame(hot_topics[:20], columns=["keyword", "mg_count"]), use_container_width=True)
+            else:
+                st.info("暂无 MG 估计结果")
+        with compare_right:
+            st.markdown("**精确基线 Top-K**")
+            if exact_hot_topics:
+                st.dataframe(pd.DataFrame(exact_hot_topics[:20], columns=["keyword", "exact_count"]), use_container_width=True)
+            else:
+                st.info("暂无精确基线结果")
+    else:
+        st.info("精确基线未开启，当前无法展示实时准确性对比。可设置环境变量 ENABLE_EXACT_BASELINE=1 后重启处理器。")
 
     st.markdown("---")
 
